@@ -67,6 +67,9 @@ impl Connection {
             ip_header.source(),
         );
 
+        // the kernel is nice and does this for us
+        // syn_ack.checksum = syn_ack.calc_checksum_ipv4(&ip, &[])?;
+
         let mut buffer = [0u8; 1500];
         let written = {
             let len = buffer.len();
