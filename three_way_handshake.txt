@@ -1,0 +1,2 @@
+RCV（收到）SYN:I want to talk, do you want to talk to me?
+SEN（发送） SYN, ACK: Yest, I want to talk to you, do you want to talk to me?
