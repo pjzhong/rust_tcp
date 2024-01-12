@@ -1,20 +1,14 @@
-use std::net::Ipv4Addr;
+use std::{cell::Ref, net::Ipv4Addr, rc::Rc};
 
 use etherparse::{ip_number, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
 use crate::{err::TcpErr, tcp};
 
 pub enum State {
-    Closed,
-    Listen,
+    //Closed,
+    //Listen,
     SynRcvd,
     Estab,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self::Listen
-    }
 }
 
 impl Connection {
@@ -30,9 +24,9 @@ impl Connection {
         }
 
         let iss = 0;
-        let connecton = Connection {
+        let mut connecton = Connection {
             state: State::SynRcvd,
-            recv: ReceiveSequenceSpace {
+            rcv: ReceiveSequenceSpace {
                 irs: tcp_header.sequence_number(),
                 nxt: tcp_header.sequence_number() + 1,
                 wnd: tcp_header.window_size(),
@@ -47,6 +41,13 @@ impl Connection {
                 wl1: 0,
                 wl2: 0,
             },
+            ip: Ipv4Header::new(
+                0,
+                64,
+                ip_number::TCP,
+                ip_header.destination(),
+                ip_header.source(),
+            ),
         };
 
         let mut syn_ack = TcpHeader::new(
@@ -55,18 +56,13 @@ impl Connection {
             connecton.send.iss,
             connecton.send.wnd,
         );
-        syn_ack.acknowledgment_number = connecton.recv.nxt;
+        syn_ack.acknowledgment_number = connecton.rcv.nxt;
         syn_ack.syn = true;
         syn_ack.ack = true;
 
-        let ip = Ipv4Header::new(
-            syn_ack.header_len(),
-            64,
-            ip_number::TCP,
-            ip_header.destination(),
-            ip_header.source(),
-        );
-
+        connecton
+            .ip
+            .set_payload_len(syn_ack.header_len() as usize)?;
         // the kernel is nice and does this for us
         // syn_ack.checksum = syn_ack.calc_checksum_ipv4(&ip, &[])?;
 
@@ -74,7 +70,7 @@ impl Connection {
         let written = {
             let len = buffer.len();
             let mut slice = &mut buffer[..];
-            ip.write(&mut slice)?;
+            connecton.ip.write(&mut slice)?;
             syn_ack.write(&mut slice)?;
 
             len - slice.len()
@@ -90,8 +86,112 @@ impl Connection {
         ip_header: &Ipv4HeaderSlice,
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
-    ) -> Result<usize, TcpErr> {
-        Ok(0)
+    ) -> Result<(), TcpErr> {
+        // acceptable ack check
+        // SND.UNA < SEG.ACK =< SND.NXT
+        // but wrapping around
+        let ackn = tcp_header.acknowledgment_number();
+        if !is_between_wrapping(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            return Ok(());
+        }
+
+        // A segment is judged to occupy a portion of valid receive sequence
+        // space if
+        //    RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        // or
+        //    RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+        let seqn = tcp_header.sequence_number();
+        let slen = {
+            // SEG.LEN = the number of octets occupied by the data in the segment
+            // (counting SYN and FIN)
+
+            let mut len = data.len();
+            if tcp_header.syn() {
+                len += 1;
+            }
+
+            if tcp_header.fin() {
+                len += 1;
+            }
+
+            len as u32
+        };
+        if slen == 0 && !tcp_header.syn() && !tcp_header.fin() {
+            if self.rcv.wnd == 0 {
+                if seqn != self.rcv.nxt {
+                    return Ok(());
+                } else if !is_between_wrapping(
+                    self.rcv.nxt.wrapping_sub(1),
+                    seqn,
+                    self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
+                ) {
+                    return Ok(());
+                }
+            }
+        } else if self.rcv.wnd == 0 {
+            return Ok(());
+        } else if !is_between_wrapping(
+            self.rcv.nxt.wrapping_sub(1),
+            seqn,
+            self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
+        ) || !is_between_wrapping(
+            self.rcv.nxt.wrapping_sub(1),
+            seqn + slen - 1,
+            self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
+        ) {
+            return Ok(());
+        }
+
+        match self.state {
+            State::SynRcvd => Ok(()),
+            State::Estab => unimplemented!(),
+        }
+    }
+}
+
+fn is_between_wrapping(start: u32, x: u32, end: u32) -> bool {
+    use std::cmp::Ordering;
+    match start.cmp(&x) {
+        Ordering::Equal => return false,
+        Ordering::Less => {
+            // we have
+            // |------------S-------X--------------------|
+            // X is between (S < X <= E) in these case
+            // |------------S-------X-----E--------------|
+            // |-----E------S-------X--------------------|
+            // but *not* in these case
+            // |------------S------------E----------X----|
+            // |------------|-------X--------------------|
+            //              ^-S+E
+            // |------------S-------|--------------------|
+            //                     ^- X+E
+
+            if start <= end && end <= x {
+                return false;
+            } else {
+                return true;
+            }
+        }
+        Ordering::Greater => {
+            // we have oppsite abbove
+            // |------------X-------S--------------------|
+            // X is between is this case (S < X <= E) in these case
+            // |-----X------E---------S------------------|
+            // but *not* in these case
+            // |-----X------S-------E--------------------|
+            // |------------S------------E----------X----|
+            // |------------|-------S--------------------|
+            //              ^-X+E
+            // |-----X------|----------------------------|
+            //              ^-S+E
+            // or in other words, iff S < E < X
+
+            if end < start && x < end {
+                return true;
+            } else {
+                return false;
+            }
+        }
     }
 }
 
@@ -156,6 +256,7 @@ pub struct ReceiveSequenceSpace {
 
 pub struct Connection {
     state: State,
-    recv: ReceiveSequenceSpace,
+    rcv: ReceiveSequenceSpace,
     send: SendSeuquenceSpace,
+    ip: Ipv4Header,
 }
