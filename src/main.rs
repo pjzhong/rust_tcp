@@ -35,6 +35,7 @@ fn main() -> io::Result<()> {
                 let proto = ip_header.protocol();
 
                 if proto != TCP_PROTO {
+                    eprintln!("Bad PROTO");
                     continue;
                 }
 
@@ -70,7 +71,9 @@ fn main() -> io::Result<()> {
                                     Ok(Some(c)) => {
                                         entry.insert(c);
                                     }
-                                    Ok(None) => {}
+                                    Ok(None) => {
+                                        eprintln!("No Connection");
+                                    }
                                     Err(e) => {
                                         eprintln!("Accept connection error:{:?}", e);
                                     }

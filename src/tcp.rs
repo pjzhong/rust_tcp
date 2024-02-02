@@ -1,14 +1,34 @@
-use std::{cell::Ref, net::Ipv4Addr, rc::Rc};
+use std::{
+    cell::Ref,
+    io::{self, Error, ErrorKind},
+    net::Ipv4Addr,
+};
 
 use etherparse::{ip_number, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
-use crate::{err::TcpErr, tcp};
+use crate::err::TcpErr;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum State {
     //Closed,
     //Listen,
     SynRcvd,
     Estab,
+    FinWait1,
+    FinWait2,
+    Closing,
+    TimeWait,
+}
+
+impl State {
+    pub fn is_synchronized(&self) -> bool {
+        match self {
+            State::Estab | State::FinWait1 | State::Closing | State::FinWait2 | Self::TimeWait => {
+                true
+            }
+            State::SynRcvd => false,
+        }
+    }
 }
 
 impl Connection {
@@ -18,6 +38,12 @@ impl Connection {
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
     ) -> Result<Option<Self>, TcpErr> {
+        eprintln!(
+            "Got packet fin:{}, se:{}, ack:{}",
+            tcp_header.fin(),
+            tcp_header.sequence_number(),
+            tcp_header.acknowledgment_number()
+        );
         if !tcp_header.syn() {
             // only expected syn packet
             return Ok(None);
@@ -32,10 +58,10 @@ impl Connection {
                 wnd: tcp_header.window_size(),
                 up: 0,
             },
-            send: SendSeuquenceSpace {
+            snd: SendSeuquenceSpace {
                 iss,
                 una: iss,
-                nxt: iss + 1,
+                nxt: iss,
                 wnd: tcp_header.window_size(),
                 up: 0,
                 wl1: 0,
@@ -48,53 +74,37 @@ impl Connection {
                 ip_header.destination(),
                 ip_header.source(),
             ),
+
+            tcp: TcpHeader::new(
+                tcp_header.destination_port(),
+                tcp_header.source_port(),
+                iss,
+                10,
+            ),
         };
 
-        let mut syn_ack = TcpHeader::new(
-            tcp_header.destination_port(),
-            tcp_header.source_port(),
-            connecton.send.iss,
-            connecton.send.wnd,
-        );
-        syn_ack.acknowledgment_number = connecton.rcv.nxt;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
+        connecton.tcp.acknowledgment_number = connecton.rcv.nxt;
+        connecton.tcp.syn = true;
+        connecton.tcp.ack = true;
 
-        connecton
-            .ip
-            .set_payload_len(syn_ack.header_len() as usize)?;
-        // the kernel is nice and does this for us
-        // syn_ack.checksum = syn_ack.calc_checksum_ipv4(&ip, &[])?;
+        connecton.write(ipface, &[])?;
 
-        let mut buffer = [0u8; 1500];
-        let written = {
-            let len = buffer.len();
-            let mut slice = &mut buffer[..];
-            connecton.ip.write(&mut slice)?;
-            syn_ack.write(&mut slice)?;
-
-            len - slice.len()
-        };
-
-        ipface.send(&buffer[..written])?;
         Ok(Some(connecton))
     }
 
     pub fn on_packet(
         &mut self,
-        ipface: &mut tun_tap::Iface,
+        nic: &mut tun_tap::Iface,
         ip_header: &Ipv4HeaderSlice,
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
     ) -> Result<(), TcpErr> {
-        // acceptable ack check
-        // SND.UNA < SEG.ACK =< SND.NXT
-        // but wrapping around
-        let ackn = tcp_header.acknowledgment_number();
-        if !is_between_wrapping(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-            return Ok(());
-        }
-
+        eprintln!(
+            "Got packet fin:{}, se:{}, ack:{}",
+            tcp_header.fin(),
+            tcp_header.sequence_number(),
+            tcp_header.acknowledgment_number()
+        );
         // A segment is judged to occupy a portion of valid receive sequence
         // space if
         //    RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
@@ -105,7 +115,7 @@ impl Connection {
             // SEG.LEN = the number of octets occupied by the data in the segment
             // (counting SYN and FIN)
 
-            let mut len = data.len();
+            let mut len = data.len() as u32;
             if tcp_header.syn() {
                 len += 1;
             }
@@ -114,38 +124,181 @@ impl Connection {
                 len += 1;
             }
 
-            len as u32
+            len
         };
-        if slen == 0 && !tcp_header.syn() && !tcp_header.fin() {
+        let wend = self.rcv.nxt.wrapping_add(self.rcv.wnd as u32);
+        let okay = if slen == 0 {
             if self.rcv.wnd == 0 {
                 if seqn != self.rcv.nxt {
-                    return Ok(());
-                } else if !is_between_wrapping(
-                    self.rcv.nxt.wrapping_sub(1),
-                    seqn,
-                    self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
-                ) {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
+            } else if !is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend) {
+                false
+            } else {
+                true
             }
-        } else if self.rcv.wnd == 0 {
+        } else {
+            if self.rcv.wnd == 0 {
+                false
+            } else if !is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend)
+                && !is_between_wrapping(
+                    self.rcv.nxt.wrapping_sub(1),
+                    seqn.wrapping_add(slen - 1),
+                    wend,
+                )
+            {
+                false
+            } else {
+                true
+            }
+        };
+
+        eprintln!("1");
+        if !okay {
+            eprintln!("Dropping");
+            self.write(nic, &[])?;
             return Ok(());
-        } else if !is_between_wrapping(
-            self.rcv.nxt.wrapping_sub(1),
-            seqn,
-            self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
-        ) || !is_between_wrapping(
-            self.rcv.nxt.wrapping_sub(1),
-            seqn + slen - 1,
-            self.rcv.nxt.wrapping_add(self.rcv.wnd as u32),
-        ) {
+        }
+        self.rcv.nxt = seqn.wrapping_add(slen);
+
+        eprintln!("1");
+        if !tcp_header.ack() {
+            eprintln!("No ack!!!!!!!!!!!!!!!!!");
             return Ok(());
+        }
+        eprintln!("1");
+        // // acceptable ack check
+        // // SND.UNA < SEG.ACK =< SND.NXT
+        // // but wrapping around
+        // let ackn = tcp_header.acknowledgment_number();
+        // if !is_between_wrapping(self.snd.una, ackn, self.snd.nxt.wrapping_add(1)) {
+        //     if !self.state.is_synchronized() {
+        //         self.send_rst(ipface)?;
+        //     }
+        //     return Ok(());
+        // }
+
+        // self.snd.una = ackn;
+        let ackn = tcp_header.acknowledgment_number();
+        if State::SynRcvd == self.state {
+            if is_between_wrapping(
+                self.snd.una.wrapping_sub(1),
+                ackn,
+                self.snd.nxt.wrapping_add(1),
+            ) {
+                self.state = State::Estab;
+            } else {
+                //TODO  <SEQ=SEG.ACK><CTL=RST>
+            }
         }
 
-        match self.state {
-            State::SynRcvd => Ok(()),
-            State::Estab => unimplemented!(),
+        if State::Estab == self.state
+            || State::FinWait1 == self.state
+            || State::FinWait2 == self.state
+        {
+            if !is_between_wrapping(self.snd.una, ackn, self.snd.nxt.wrapping_add(1)) {
+                return Ok(());
+            }
+
+            self.snd.una = ackn;
+
+            if State::Estab == self.state {
+                eprintln!("we're established and got stuff");
+
+                dbg!(tcp_header.fin());
+                dbg!(self.tcp.fin);
+
+                //TODO lot of stuffs to do
+                assert!(data.is_empty());
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+            }
         }
+        eprintln!("1");
+        if State::FinWait1 == self.state {
+            // check the syn and the fin we just send has been acked
+            if self.snd.una == self.snd.iss + 2 {
+                eprintln!("THEY'VE ACKED OUR FIN");
+                self.state = State::FinWait2;
+            }
+        }
+
+        eprintln!("1, state:{:?}", self.state);
+        if tcp_header.fin() {
+            match self.state {
+                State::FinWait2 => {
+                    eprintln!("THEY'VE FINED");
+                    self.write(nic, &[])?;
+                    self.state = State::TimeWait;
+                }
+                _ => unimplemented!(),
+            }
+        }
+
+        eprintln!("RET");
+        Ok(())
+    }
+
+    fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> Result<u32, TcpErr> {
+        let mut buffer = [0u8; 1500];
+        self.tcp.sequence_number = self.snd.nxt;
+        self.tcp.acknowledgment_number = self.rcv.nxt;
+        let size = buffer
+            .len()
+            .min(self.tcp.header_len() as usize + self.ip.header_len() as usize + payload.len());
+        self.ip.set_payload_len(size - self.ip.header_len())?;
+
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
+            .expect("failed to compute checksum");
+
+        use std::io::Write;
+        let mut slice = &mut buffer[..];
+        self.ip.write(&mut slice)?;
+        self.tcp.write(&mut slice)?;
+        let payload_bytes = slice.write(payload)? as u32;
+        let unwritten = slice.len();
+        nic.send(&buffer[..buffer.len() - unwritten])?;
+
+        self.snd.nxt = self.snd.nxt.wrapping_add(payload_bytes);
+        if self.tcp.syn {
+            self.snd.nxt = self.snd.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+
+        if self.tcp.fin {
+            self.snd.nxt = self.snd.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+        Ok(payload_bytes)
+    }
+
+    fn send_rst(&mut self, nic: &mut tun_tap::Iface) -> Result<(), TcpErr> {
+        self.tcp.rst = true;
+        // TODO: fix sequence number
+        // If the incoming segment has an ACK field, the reset takes its
+        // sequence number from the ACK field of the segment, otherwise the
+        // reset has sequence number zero and the ACK field is set to the sum
+        // of the sequence number and segment length of the incoming segment.
+        // The connection remains in the CLOSED state.
+
+        // TODO: handle synchronized RST
+        // 3.  If the connection is in a synchronized state (ESTABLISHED,
+        //     FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT),
+        //     any unacceptable segment (out of window sequence number or
+        //     unacceptible acknowledgment number) must elicit only an empty
+        //     acknowledgment segment containing the current send-sequence number
+        //     and an acknowledgment indicating the next sequence number expected
+        //     to be received, and the connection remains in the same state.
+
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.write(nic, &[])?;
+        Ok(())
     }
 }
 
@@ -257,6 +410,7 @@ pub struct ReceiveSequenceSpace {
 pub struct Connection {
     state: State,
     rcv: ReceiveSequenceSpace,
-    send: SendSeuquenceSpace,
+    snd: SendSeuquenceSpace,
     ip: Ipv4Header,
+    tcp: TcpHeader,
 }
