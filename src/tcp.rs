@@ -79,7 +79,7 @@ impl Connection {
                 tcp_header.destination_port(),
                 tcp_header.source_port(),
                 iss,
-                10,
+                tcp_header.window_size(),
             ),
         };
 
@@ -302,51 +302,68 @@ impl Connection {
     }
 }
 
-fn is_between_wrapping(start: u32, x: u32, end: u32) -> bool {
-    use std::cmp::Ordering;
-    match start.cmp(&x) {
-        Ordering::Equal => return false,
-        Ordering::Less => {
-            // we have
-            // |------------S-------X--------------------|
-            // X is between (S < X <= E) in these case
-            // |------------S-------X-----E--------------|
-            // |-----E------S-------X--------------------|
-            // but *not* in these case
-            // |------------S------------E----------X----|
-            // |------------|-------X--------------------|
-            //              ^-S+E
-            // |------------S-------|--------------------|
-            //                     ^- X+E
-
-            if start <= end && end <= x {
-                return false;
-            } else {
-                return true;
-            }
-        }
-        Ordering::Greater => {
-            // we have oppsite abbove
-            // |------------X-------S--------------------|
-            // X is between is this case (S < X <= E) in these case
-            // |-----X------E---------S------------------|
-            // but *not* in these case
-            // |-----X------S-------E--------------------|
-            // |------------S------------E----------X----|
-            // |------------|-------S--------------------|
-            //              ^-X+E
-            // |-----X------|----------------------------|
-            //              ^-S+E
-            // or in other words, iff S < E < X
-
-            if end < start && x < end {
-                return true;
-            } else {
-                return false;
-            }
-        }
-    }
+// I am not quiet understanding this version, but the streaming use this So I keep with it
+fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
+    // From RFC1323:
+    //     TCP determines if a data segment is "old" or "new" by testing
+    //     whether its sequence number is within 2**31 bytes of the left edge
+    //     of the window, and if it is not, discarding the data as "old".  To
+    //     insure that new data is never mistakenly considered old and vice-
+    //     versa, the left edge of the sender's window has to be at most
+    //     2**31 away from the right edge of the receiver's window.
+    lhs.wrapping_sub(rhs) > (1 << 31)
 }
+
+fn is_between_wrapping(start: u32, x: u32, end: u32) -> bool {
+    wrapping_lt(start, x) && wrapping_lt(x, end)
+}
+
+//This version is also right
+// fn is_between_wrapping1(start: u32, x: u32, end: u32) -> bool {
+//     use std::cmp::Ordering;
+//     match start.cmp(&x) {
+//         Ordering::Equal => return false,
+//         Ordering::Less => {
+//             // we have
+//             // |------------S-------X--------------------|
+//             // X is between (S < X <= E) in these case
+//             // |------------S-------X-----E--------------|
+//             // |-----E------S-------X--------------------|
+//             // but *not* in these case
+//             // |------------S------------E----------X----|
+//             // |------------|-------X--------------------|
+//             //              ^-S+E
+//             // |------------S-------|--------------------|
+//             //                     ^- X+E
+
+//             if start <= end && end <= x {
+//                 return false;
+//             } else {
+//                 return true;
+//             }
+//         }
+//         Ordering::Greater => {
+//             // we have oppsite abbove
+//             // |------------X-------S--------------------|
+//             // X is between is this case (S < X <= E) in these case
+//             // |-----X------E---------S------------------|
+//             // but *not* in these case
+//             // |-----X------S-------E--------------------|
+//             // |------------S------------E----------X----|
+//             // |------------|-------S--------------------|
+//             //              ^-X+E
+//             // |-----X------|----------------------------|
+//             //              ^-S+E
+//             // or in other words, iff S < E < X
+
+//             if end < start && x < end {
+//                 return true;
+//             } else {
+//                 return false;
+//             }
+//         }
+//     }
+// }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Quad {
