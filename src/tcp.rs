@@ -1,8 +1,4 @@
-use std::{
-    cell::Ref,
-    io::{self, Error, ErrorKind},
-    net::Ipv4Addr,
-};
+use std::collections::VecDeque;
 
 use etherparse::{ip_number, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
@@ -81,6 +77,8 @@ impl Connection {
                 iss,
                 tcp_header.window_size(),
             ),
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
 
         connecton.tcp.acknowledgment_number = connecton.rcv.nxt;
@@ -365,12 +363,6 @@ fn is_between_wrapping(start: u32, x: u32, end: u32) -> bool {
 //     }
 // }
 
-#[derive(Debug, Hash, Eq, PartialEq)]
-pub struct Quad {
-    pub src: (Ipv4Addr, u16),
-    pub dst: (Ipv4Addr, u16),
-}
-
 /// Send Sequence Variables
 /// SND.UNA - send unacknowledged
 /// SND.NXT - send next
@@ -430,4 +422,7 @@ pub struct Connection {
     snd: SendSeuquenceSpace,
     ip: Ipv4Header,
     tcp: TcpHeader,
+
+    pub incoming: VecDeque<u8>,
+    pub unacked: VecDeque<u8>,
 }

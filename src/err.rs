@@ -1,4 +1,4 @@
-use std::io::Error;
+use std::{io::Error, sync::mpsc::RecvError};
 
 use etherparse::{ValueError, WriteError};
 #[derive(Debug)]
@@ -6,6 +6,7 @@ pub enum TcpErr {
     Io(Error),
     EtherParseErr(WriteError),
     ValueError(ValueError),
+    RecvError(RecvError),
 }
 
 impl From<Error> for TcpErr {
@@ -23,5 +24,11 @@ impl From<WriteError> for TcpErr {
 impl From<ValueError> for TcpErr {
     fn from(value: ValueError) -> Self {
         Self::ValueError(value)
+    }
+}
+
+impl From<RecvError> for TcpErr {
+    fn from(value: RecvError) -> Self {
+        Self::RecvError(value)
     }
 }

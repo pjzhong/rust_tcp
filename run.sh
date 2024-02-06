@@ -4,8 +4,8 @@ ext=$?
 if [[ $ext -ne 0 ]]; then 
     exit $ext
 fi
-sudo setcap cap_net_admin=eip ./target/release/rust_tcp
-./target/release/rust_tcp & 
+sudo setcap cap_net_admin=eip ./target/release/trust
+./target/release/trust & 
 pid=$!
 sudo ip addr add 192.168.0.1/24 dev tun0
 sudo ip link set up dev tun0
