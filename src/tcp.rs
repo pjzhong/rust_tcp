@@ -1,8 +1,16 @@
+use bitflags::bitflags;
 use std::collections::VecDeque;
 
 use etherparse::{ip_number, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 
 use crate::err::TcpErr;
+
+bitflags! {
+    pub struct Available: u32 {
+        const Read = 0b00000001;
+        const Write = 0b00000010;
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum State {
@@ -96,7 +104,7 @@ impl Connection {
         ip_header: &Ipv4HeaderSlice,
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
-    ) -> Result<(), TcpErr> {
+    ) -> Result<Available, TcpErr> {
         eprintln!(
             "Got packet fin:{}, se:{}, ack:{}",
             tcp_header.fin(),
@@ -153,20 +161,16 @@ impl Connection {
             }
         };
 
-        eprintln!("1");
         if !okay {
-            eprintln!("Dropping");
             self.write(nic, &[])?;
-            return Ok(());
+            return Ok(self.availability());
         }
         self.rcv.nxt = seqn.wrapping_add(slen);
-
-        eprintln!("1");
+        println!("1");
         if !tcp_header.ack() {
-            eprintln!("No ack!!!!!!!!!!!!!!!!!");
-            return Ok(());
+            return Ok(self.availability());
         }
-        eprintln!("1");
+
         // // acceptable ack check
         // // SND.UNA < SEG.ACK =< SND.NXT
         // // but wrapping around
@@ -196,11 +200,13 @@ impl Connection {
             || State::FinWait1 == self.state
             || State::FinWait2 == self.state
         {
-            if !is_between_wrapping(self.snd.una, ackn, self.snd.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapping(
+                dbg!(self.snd.una),
+                dbg!(ackn),
+                dbg!(self.snd.nxt.wrapping_add(1)),
+            ) {
+                self.snd.una = ackn;
             }
-
-            self.snd.una = ackn;
 
             if State::Estab == self.state {
                 eprintln!("we're established and got stuff");
@@ -215,7 +221,7 @@ impl Connection {
                 self.state = State::FinWait1;
             }
         }
-        eprintln!("1");
+
         if State::FinWait1 == self.state {
             // check the syn and the fin we just send has been acked
             if self.snd.una == self.snd.iss + 2 {
@@ -224,7 +230,6 @@ impl Connection {
             }
         }
 
-        eprintln!("1, state:{:?}", self.state);
         if tcp_header.fin() {
             match self.state {
                 State::FinWait2 => {
@@ -236,8 +241,7 @@ impl Connection {
             }
         }
 
-        eprintln!("RET");
-        Ok(())
+        Ok(self.availability())
     }
 
     fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> Result<u32, TcpErr> {
@@ -297,6 +301,26 @@ impl Connection {
         self.tcp.acknowledgment_number = 0;
         self.write(nic, &[])?;
         Ok(())
+    }
+
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        eprintln!("222");
+        if self.state == State::TimeWait {
+            eprintln!("111");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availability(&self) -> Available {
+        let mut a = Available::empty();
+
+        if self.is_rcv_closed() || !self.incoming.is_empty() {
+            a |= Available::Read
+        }
+
+        a
     }
 }
 
@@ -423,6 +447,6 @@ pub struct Connection {
     ip: Ipv4Header,
     tcp: TcpHeader,
 
-    pub incoming: VecDeque<u8>,
-    pub unacked: VecDeque<u8>,
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }

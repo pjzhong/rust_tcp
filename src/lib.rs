@@ -13,6 +13,8 @@ use std::{
 use err::TcpErr;
 use tcp::Connection;
 
+use crate::tcp::Available;
+
 //type InterfaceHandle = mpsc::Sender<InterfaceRequest>;
 type InterfaceHandle = Arc<Foobar>;
 
@@ -71,12 +73,21 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> Result<()> {
                         use std::collections::hash_map::Entry;
                         match cm.connections.entry(q) {
                             Entry::Occupied(mut c) => {
-                                c.get_mut().on_packet(
+                                let a = c.get_mut().on_packet(
                                     &mut nic,
                                     &ip_header,
                                     &tcph,
                                     &buf[datai..nbyte],
                                 )?;
+
+                                drop(cmg);
+                                if a.contains(tcp::Available::Read) {
+                                    ih.rcv_var.notify_all();
+                                }
+
+                                if a.contains(tcp::Available::Write) {
+                                    ih.rcv_var.notify_all();
+                                }
                             }
                             Entry::Vacant(entry) => {
                                 if let Some(pending) = cm.pending.get_mut(&tcph.destination_port())
@@ -110,6 +121,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> Result<()> {
 struct Foobar {
     manager: Mutex<ConnectionManager>,
     pending_var: Condvar,
+    rcv_var: Condvar,
 }
 
 pub struct Interface {
@@ -190,29 +202,34 @@ pub struct TcpStream {
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut cm = self.ih.manager.lock().unwrap();
-        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
-            Error::new(
-                ErrorKind::ConnectionAborted,
-                "stream was terminated unexpectedly",
-            )
-        })?;
+        loop {
+            let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::ConnectionAborted,
+                    "stream was terminated unexpectedly",
+                )
+            })?;
 
-        if c.incoming.is_empty() {
-            //TODO block
-            return Err(Error::new(ErrorKind::WouldBlock, "no bytes to read"));
+            if c.is_rcv_closed() && c.incoming.is_empty() {
+                // no more data to read, and no need to block, because there won't be any more
+                return Ok(0);
+            }
+
+            if !c.incoming.is_empty() {
+                // TODO detect FIN and return nread == 0;
+
+                let mut nread = 0;
+                let (head, tail) = c.incoming.as_slices();
+                for slice in [head, tail] {
+                    let read = buf.len().saturating_sub(nread).min(slice.len());
+                    buf.copy_from_slice(&slice[..read]);
+                    nread += read;
+                }
+                drop(c.incoming.drain(..nread));
+                return Ok(nread);
+            }
+            cm = self.ih.rcv_var.wait(cm).unwrap();
         }
-
-        // TODO detect FIN and return nread == 0;
-
-        let mut nread = 0;
-        let (head, tail) = c.incoming.as_slices();
-        for slice in [head, tail] {
-            let read = buf.len().saturating_sub(nread).min(slice.len());
-            buf.copy_from_slice(&slice[..read]);
-            nread += read;
-        }
-        drop(c.incoming.drain(..nread));
-        Ok(nread)
     }
 }
 
