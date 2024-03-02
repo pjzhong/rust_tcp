@@ -14,6 +14,7 @@ fn main() -> io::Result<()> {
             let n = stream.read(&mut [0]).unwrap();
             eprintln!("read data");
             assert_eq!(n, 0);
+            eprintln!("no more data");
         }
     });
 

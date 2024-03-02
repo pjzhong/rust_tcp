@@ -40,7 +40,7 @@ impl Connection {
         ipface: &mut tun_tap::Iface,
         ip_header: &Ipv4HeaderSlice,
         tcp_header: &TcpHeaderSlice,
-        data: &[u8],
+        _data: &[u8],
     ) -> Result<Option<Self>, TcpErr> {
         eprintln!(
             "Got packet fin:{}, se:{}, ack:{}",
@@ -101,7 +101,7 @@ impl Connection {
     pub fn on_packet(
         &mut self,
         nic: &mut tun_tap::Iface,
-        ip_header: &Ipv4HeaderSlice,
+        _ip_header: &Ipv4HeaderSlice,
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
     ) -> Result<Available, TcpErr> {
@@ -135,30 +135,19 @@ impl Connection {
         let wend = self.rcv.nxt.wrapping_add(self.rcv.wnd as u32);
         let okay = if slen == 0 {
             if self.rcv.wnd == 0 {
-                if seqn != self.rcv.nxt {
-                    false
-                } else {
-                    true
-                }
-            } else if !is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend) {
-                false
+                seqn == self.rcv.nxt
             } else {
-                true
+                is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend)
             }
+        } else if self.rcv.wnd == 0 {
+            false
         } else {
-            if self.rcv.wnd == 0 {
-                false
-            } else if !is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend)
+            !(!is_between_wrapping(self.rcv.nxt.wrapping_sub(1), seqn, wend)
                 && !is_between_wrapping(
                     self.rcv.nxt.wrapping_sub(1),
                     seqn.wrapping_add(slen - 1),
                     wend,
-                )
-            {
-                false
-            } else {
-                true
-            }
+                ))
         };
 
         if !okay {
@@ -200,6 +189,7 @@ impl Connection {
             || State::FinWait1 == self.state
             || State::FinWait2 == self.state
         {
+            // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
             if is_between_wrapping(
                 dbg!(self.snd.una),
                 dbg!(ackn),
@@ -250,7 +240,7 @@ impl Connection {
         self.tcp.acknowledgment_number = self.rcv.nxt;
         let size = buffer
             .len()
-            .min(self.tcp.header_len() as usize + self.ip.header_len() as usize + payload.len());
+            .min(self.tcp.header_len() as usize + self.ip.header_len() + payload.len());
         self.ip.set_payload_len(size - self.ip.header_len())?;
 
         self.tcp.checksum = self

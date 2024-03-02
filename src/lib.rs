@@ -13,8 +13,6 @@ use std::{
 use err::TcpErr;
 use tcp::Connection;
 
-use crate::tcp::Available;
-
 //type InterfaceHandle = mpsc::Sender<InterfaceRequest>;
 type InterfaceHandle = Arc<Foobar>;
 
@@ -175,8 +173,7 @@ impl Interface {
                 return Err(Error::new(
                     std::io::ErrorKind::AddrInUse,
                     format!("port:{} already bound", port),
-                )
-                .into());
+                ));
             }
         }
         // TODO something to start accepting SYN packets on 'port'
@@ -267,10 +264,10 @@ impl Write for TcpStream {
         })?;
 
         if c.unacked.is_empty() {
-            return Ok(());
+            Ok(())
         } else {
             //TODO block
-            return Err(Error::new(ErrorKind::WouldBlock, "too many bytes buffered"));
+            Err(Error::new(ErrorKind::WouldBlock, "too many bytes buffered"))
         }
     }
 }
@@ -287,7 +284,7 @@ impl Drop for TcpStream {
 }
 
 impl TcpStream {
-    pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+    pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
         unimplemented!()
     }
 }
@@ -305,7 +302,7 @@ impl Drop for TcpListener {
             .remove(&self.port)
             .expect("port closed while listener still active");
 
-        for quad in pending {
+        for _quad in pending {
             //TODO terminated cm.connections[quad]
             unimplemented!("terminated cm.connections[quad]")
         }
