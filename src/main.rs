@@ -9,12 +9,22 @@ fn main() -> io::Result<()> {
     let mut l1 = i.bind(6000)?;
 
     let jh1 = thread::spawn(move || {
-        while let Ok(mut stream) = l1.accept() {
+        let mut buf = [0; 512];
+        if let Ok(mut stream) = l1.accept() {
             println!("l1 accept connection");
-            let n = stream.read(&mut [0]).unwrap();
-            eprintln!("read data");
-            assert_eq!(n, 0);
-            eprintln!("no more data");
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    eprintln!("No more data!");
+                    break;
+                } else {
+                    println!(
+                        "read {:?}b of data, got {}",
+                        n,
+                        String::from_utf8_lossy(&buf[..n])
+                    )
+                }
+            }
         }
     });
 

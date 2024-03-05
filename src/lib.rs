@@ -110,7 +110,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> Result<()> {
                     Err(e) => eprintln!("ignoring weired tcp packet {:?}", e),
                 }
             }
-            Err(e) => eprintln!("ignoring weired packet {:?}", e),
+            Err(e) => {}
         };
     }
 }
@@ -147,7 +147,6 @@ impl Interface {
             let cm = tx.clone();
             thread::spawn(move || {
                 let nic = nic;
-                let cm = cm;
                 if let Err(e) = packet_loop(nic, cm) {
                     eprintln!("packet_loop, error:{:?}", e)
                 }
@@ -219,7 +218,7 @@ impl Read for TcpStream {
                 let (head, tail) = c.incoming.as_slices();
                 for slice in [head, tail] {
                     let read = buf.len().saturating_sub(nread).min(slice.len());
-                    buf.copy_from_slice(&slice[..read]);
+                    buf[nread..(nread + read)].copy_from_slice(&slice[..read]);
                     nread += read;
                 }
                 drop(c.incoming.drain(..nread));

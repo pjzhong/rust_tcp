@@ -42,12 +42,12 @@ impl Connection {
         tcp_header: &TcpHeaderSlice,
         _data: &[u8],
     ) -> Result<Option<Self>, TcpErr> {
-        eprintln!(
-            "Got packet fin:{}, se:{}, ack:{}",
-            tcp_header.fin(),
-            tcp_header.sequence_number(),
-            tcp_header.acknowledgment_number()
-        );
+        // eprintln!(
+        //     "Got packet fin:{}, se:{}, ack:{}",
+        //     tcp_header.fin(),
+        //     tcp_header.sequence_number(),
+        //     tcp_header.acknowledgment_number()
+        // );
         if !tcp_header.syn() {
             // only expected syn packet
             return Ok(None);
@@ -105,12 +105,12 @@ impl Connection {
         tcp_header: &TcpHeaderSlice,
         data: &[u8],
     ) -> Result<Available, TcpErr> {
-        eprintln!(
-            "Got packet fin:{}, se:{}, ack:{}",
-            tcp_header.fin(),
-            tcp_header.sequence_number(),
-            tcp_header.acknowledgment_number()
-        );
+        // eprintln!(
+        //     "Got packet fin:{}, se:{}, ack:{}",
+        //     tcp_header.fin(),
+        //     tcp_header.sequence_number(),
+        //     tcp_header.acknowledgment_number()
+        // );
         // A segment is judged to occupy a portion of valid receive sequence
         // space if
         //    RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
@@ -154,8 +154,8 @@ impl Connection {
             self.write(nic, &[])?;
             return Ok(self.availability());
         }
-        self.rcv.nxt = seqn.wrapping_add(slen);
-        println!("1");
+
+        //self.rcv.nxt = seqn.wrapping_add(slen);
         if !tcp_header.ack() {
             return Ok(self.availability());
         }
@@ -190,24 +190,14 @@ impl Connection {
             || State::FinWait2 == self.state
         {
             // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
-            if is_between_wrapping(
-                dbg!(self.snd.una),
-                dbg!(ackn),
-                dbg!(self.snd.nxt.wrapping_add(1)),
-            ) {
+            if is_between_wrapping(self.snd.una, ackn, self.snd.nxt.wrapping_add(1)) {
                 self.snd.una = ackn;
             }
 
+            //FIXME: we don't support Write yet, so immediately send EOF
             if State::Estab == self.state {
-                eprintln!("we're established and got stuff");
-
-                dbg!(tcp_header.fin());
-                dbg!(self.tcp.fin);
-
                 //TODO lot of stuffs to do
-                assert!(data.is_empty());
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
         }
@@ -218,6 +208,40 @@ impl Connection {
                 eprintln!("THEY'VE ACKED OUR FIN");
                 self.state = State::FinWait2;
             }
+        }
+
+        if State::Estab == self.state
+            || State::FinWait1 == self.state
+            || State::FinWait2 == self.state
+        {
+            let mut unread_data_at = (self.rcv.nxt - seqn) as usize;
+            if unread_data_at > data.len() {
+                // we must have received a re-transmitted FIN that we have already
+                // seen nxt points to beyond the fin, but the fin is not in data
+                assert_eq!(unread_data_at, data.len() + 1);
+                unread_data_at = 0;
+            }
+            //TODO only read stfuf we haven't read
+            //Would index out of range
+            self.incoming.extend(&data[unread_data_at..]);
+
+            // Once the TCP takes responsibility for the data it advances
+            // RCV.NXT over the data accepted, and adjusts RCV.WND as
+            // apporopriate to the current buffer availability.  The total of
+            // RCV.NXT and RCV.WND should not be reduced
+            self.rcv.nxt = seqn.wrapping_add({
+                let mut len = data.len() as u32;
+                if tcp_header.fin() {
+                    len += 1;
+                }
+
+                len
+            });
+
+            // Send an acknowledgment of the form:
+            //<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            self.write(nic, &[])?;
+            //TODO: wake up waiting readers
         }
 
         if tcp_header.fin() {
@@ -294,13 +318,7 @@ impl Connection {
     }
 
     pub(crate) fn is_rcv_closed(&self) -> bool {
-        eprintln!("222");
-        if self.state == State::TimeWait {
-            eprintln!("111");
-            true
-        } else {
-            false
-        }
+        self.state == State::TimeWait 
     }
 
     fn availability(&self) -> Available {
