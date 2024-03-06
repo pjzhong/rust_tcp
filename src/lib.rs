@@ -11,6 +11,8 @@ use std::{
 };
 
 use err::TcpErr;
+use nix::poll::{poll, EventFlags, PollFd};
+use std::os::fd::AsRawFd;
 use tcp::Connection;
 
 //type InterfaceHandle = mpsc::Sender<InterfaceRequest>;
@@ -33,6 +35,20 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> Result<()> {
     let mut buf = [0u8; 1504];
 
     loop {
+        let pool_fd = PollFd::new(nic.as_raw_fd(), EventFlags::POLLIN);
+        let n = poll(&mut [pool_fd], 1)?;
+        if n == 0 {
+            let mut cmg = ih.manager.lock().unwrap();
+            for (quad, connection) in &mut cmg.connections {
+                if let Err(e) = connection.on_tick(&mut nic) {
+                    eprintln!("quad:{:?}, tick_err:{:?}", quad, e);
+                }
+            }
+            //println!("TIMERS");
+            // Is little stupid here, loop over all connections
+            continue;
+        }
+        assert!(n == 1);
         // TODO set a timeout for this recv for TCP timer or ConnectionManager::terminate
         let nbyte = nic.recv(&mut buf[..])?;
 
@@ -45,73 +61,70 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> Result<()> {
         //     continue;
         // }
 
-        match etherparse::Ipv4HeaderSlice::from_slice(&buf[TUNP_HEADER_LEN..nbyte]) {
-            Ok(ip_header) => {
-                let src = ip_header.source_addr();
-                let dst = ip_header.destination_addr();
-                let proto = ip_header.protocol();
+        if let Ok(ip_header) = etherparse::Ipv4HeaderSlice::from_slice(&buf[TUNP_HEADER_LEN..nbyte])
+        {
+            let src = ip_header.source_addr();
+            let dst = ip_header.destination_addr();
+            let proto = ip_header.protocol();
 
-                if proto != TCP_PROTO {
-                    eprintln!("Bad PROTO");
-                    continue;
-                }
+            if proto != TCP_PROTO {
+                eprintln!("Bad PROTO");
+                continue;
+            }
 
-                match etherparse::TcpHeaderSlice::from_slice(
-                    &buf[TUNP_HEADER_LEN + ip_header.slice().len()..nbyte],
-                ) {
-                    //(src_ip, src_port, dst_ip, dest_port)
-                    Ok(tcph) => {
-                        let datai = TUNP_HEADER_LEN + ip_header.slice().len() + tcph.slice().len();
-                        let mut cmg = ih.manager.lock().unwrap();
-                        let cm = cmg.deref_mut();
-                        let q = Quad {
-                            src: (src, tcph.source_port()),
-                            dst: (dst, tcph.destination_port()),
-                        };
-                        use std::collections::hash_map::Entry;
-                        match cm.connections.entry(q) {
-                            Entry::Occupied(mut c) => {
-                                let a = c.get_mut().on_packet(
+            match etherparse::TcpHeaderSlice::from_slice(
+                &buf[TUNP_HEADER_LEN + ip_header.slice().len()..nbyte],
+            ) {
+                //(src_ip, src_port, dst_ip, dest_port)
+                Ok(tcph) => {
+                    let datai = TUNP_HEADER_LEN + ip_header.slice().len() + tcph.slice().len();
+                    let mut cmg = ih.manager.lock().unwrap();
+                    let cm = cmg.deref_mut();
+                    let q = Quad {
+                        src: (src, tcph.source_port()),
+                        dst: (dst, tcph.destination_port()),
+                    };
+                    use std::collections::hash_map::Entry;
+                    match cm.connections.entry(q) {
+                        Entry::Occupied(mut c) => {
+                            let a = c.get_mut().on_packet(
+                                &mut nic,
+                                &ip_header,
+                                &tcph,
+                                &buf[datai..nbyte],
+                            )?;
+
+                            drop(cmg);
+                            if a.contains(tcp::Available::Read) {
+                                ih.rcv_var.notify_all();
+                            }
+
+                            if a.contains(tcp::Available::Write) {
+                                ih.rcv_var.notify_all();
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            if let Some(pending) = cm.pending.get_mut(&tcph.destination_port()) {
+                                if let Some(c) = Connection::accpect(
                                     &mut nic,
                                     &ip_header,
                                     &tcph,
                                     &buf[datai..nbyte],
-                                )?;
+                                )? {
+                                    entry.insert(c);
+                                    pending.push_back(q);
+                                    drop(cmg);
+                                    ih.pending_var.notify_all();
 
-                                drop(cmg);
-                                if a.contains(tcp::Available::Read) {
-                                    ih.rcv_var.notify_all();
-                                }
-
-                                if a.contains(tcp::Available::Write) {
-                                    ih.rcv_var.notify_all();
-                                }
-                            }
-                            Entry::Vacant(entry) => {
-                                if let Some(pending) = cm.pending.get_mut(&tcph.destination_port())
-                                {
-                                    if let Some(c) = Connection::accpect(
-                                        &mut nic,
-                                        &ip_header,
-                                        &tcph,
-                                        &buf[datai..nbyte],
-                                    )? {
-                                        entry.insert(c);
-                                        pending.push_back(q);
-                                        drop(cmg);
-                                        ih.pending_var.notify_all();
-
-                                        //TODO: wake up pending accept
-                                    };
-                                }
+                                    //TODO: wake up pending accept
+                                };
                             }
                         }
                     }
-                    Err(e) => eprintln!("ignoring weired tcp packet {:?}", e),
                 }
+                Err(e) => eprintln!("ignoring weired tcp packet {:?}", e),
             }
-            Err(e) => {}
-        };
+        }
     }
 }
 
@@ -194,6 +207,8 @@ pub struct TcpStream {
     quad: Quad,
     ih: InterfaceHandle,
 }
+
+impl TcpStream {}
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -284,7 +299,15 @@ impl Drop for TcpStream {
 
 impl TcpStream {
     pub fn shutdown(&self, _how: std::net::Shutdown) -> io::Result<()> {
-        unimplemented!()
+        let mut cm = self.ih.manager.lock().unwrap();
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            Error::new(
+                ErrorKind::ConnectionAborted,
+                "stream was terminated unexpectedly",
+            )
+        })?;
+
+        c.close()
     }
 }
 

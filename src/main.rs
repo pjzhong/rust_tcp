@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     thread,
 };
 
@@ -12,6 +12,7 @@ fn main() -> io::Result<()> {
         let mut buf = [0; 512];
         if let Ok(mut stream) = l1.accept() {
             println!("l1 accept connection");
+            let _ = stream.write("hello".as_bytes());
             loop {
                 let n = stream.read(&mut buf).unwrap();
                 if n == 0 {
@@ -19,7 +20,7 @@ fn main() -> io::Result<()> {
                     break;
                 } else {
                     println!(
-                        "read {:?}b of data, got {}",
+                        "read {:?}b of data, got\n{}",
                         n,
                         String::from_utf8_lossy(&buf[..n])
                     )
